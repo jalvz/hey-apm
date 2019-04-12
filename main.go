@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/csv"
 	"flag"
 	"log"
 	"math"
 	"math/rand"
 	"os"
 	"time"
+
+	"github.com/elastic/hey-apm/util"
 
 	"github.com/elastic/hey-apm/out"
 	"github.com/elastic/hey-apm/tracer"
@@ -35,6 +38,7 @@ func main() {
 		"generate transactions up to once in this duration")
 	spanMaxLimit := flag.Int("sx", 10, "max spans per transaction")
 	spanMinLimit := flag.Int("sm", 1, "min spans per transaction")
+	workloadFile := flag.String("file", "", "get workloads from a file")
 
 	flag.Parse()
 
@@ -48,27 +52,22 @@ func main() {
 	logger := out.NewApmLogger(log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lshortfile))
 	rand.Seed(*seed)
 
-	w := work.Worker{
-		RunTimeout:             *runTimeout,
-		TransactionLimit:       *transactionLimit,
-		TransactionFrequency:   *transactionFrequency,
-		MaxSpansPerTransaction: *spanMaxLimit,
-		MinSpansPerTransaction: *spanMinLimit,
-		ErrorLimit:             *errorLimit,
-		ErrorFrequency:         *errorFrequency,
-		MaxFramesPerError:      *errorFrameMaxLimit,
-		MinFramesPerError:      *errorFrameMinLimit,
+	workload := []work.Workload{
+		{work.Transaction, *transactionLimit, *transactionFrequency, *spanMaxLimit, *spanMinLimit},
+		{work.Error, *errorLimit, *errorFrequency, *errorFrameMaxLimit, *errorFrameMinLimit},
 	}
-	w.Add(work.HandleSignals())
+	if *workloadFile != "" {
+		more, err := parseFile(*workloadFile)
+		logger.Error(err)
+		workload = append(workload, more...)
+	}
 
 	logger.Debugf("start")
 	defer logger.Debugf("finish")
 	tracer := tracer.NewTracer(logger, *flushTimeout, *apmServerSecret, *apmServerUrl)
 
-	report, err := w.Work(tracer)
-	if err != nil {
-		logger.Errorf(err.Error())
-	}
+	report, err := work.Run(tracer, *runTimeout, workload)
+	logger.Error(err)
 	logger.Debugf("%s elapsed since event generation completed", time.Now().Sub(report.Stop))
 	e, de := report.Stats.ErrorsSent, report.Stats.ErrorsDropped
 	t, dt := report.Stats.TransactionsSent, report.Stats.TransactionsDropped
@@ -82,4 +81,26 @@ func main() {
 
 func per(i1, i2 uint64) float64 {
 	return float64(i1) * 100 / (float64(i1) + float64(i2))
+}
+
+func parseFile(workloadFile string) ([]work.Workload, error) {
+	ret := make([]work.Workload, 0)
+	f, err := os.Open(workloadFile)
+	if err != nil {
+		return ret, err
+	}
+	defer f.Close()
+	lines, err := csv.NewReader(f).ReadAll()
+	for _, line := range lines {
+		evtType, err := util.Aton(util.Get(0, line), err)
+		limit, err := util.Aton(util.Get(1, line), err)
+		freq, err := util.Atod(util.Get(2, line), err)
+		maxStructs, err := util.Aton(util.Get(3, line), err)
+		minStructs, err := util.Aton(util.Get(4, line), err)
+		if err != nil {
+			break
+		}
+		ret = append(ret, work.Workload{evtType, limit, freq, maxStructs, minStructs})
+	}
+	return ret, err
 }

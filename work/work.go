@@ -11,26 +11,27 @@ import (
 	"sync"
 	"time"
 
+	"github.com/heptio/workgroup"
+
 	"github.com/elastic/hey-apm/tracer"
 
-	"github.com/heptio/workgroup"
 	"go.elastic.co/apm"
 	"go.elastic.co/apm/stacktrace"
 )
 
-type Worker struct {
-	// not to be modified concurrently
-	workgroup.Group
+const (
+	Transaction = iota
+	Error       = iota
+)
 
-	RunTimeout             time.Duration
-	TransactionLimit       int
-	TransactionFrequency   time.Duration
-	MaxSpansPerTransaction int
-	MinSpansPerTransaction int
-	ErrorLimit             int
-	ErrorFrequency         time.Duration
-	MaxFramesPerError      int
-	MinFramesPerError      int
+type Workload struct {
+	EventType int
+	Limit     int
+	Frequency time.Duration
+	// for transactions MaxStructs is maximum number of spans per transaction
+	// for errors it is minimum number of frames per error
+	MaxStructs int
+	MinStructs int
 }
 
 type Report struct {
@@ -42,24 +43,35 @@ type Report struct {
 	End time.Time
 }
 
-func (w *Worker) Work(tracer *tracer.Tracer) (Report, error) {
+func Run(t *tracer.Tracer, runTimeout time.Duration, workload []Workload) (Report, error) {
+	var w workgroup.Group
 
-	if w.ErrorLimit > 0 {
-		w.Add(errors(throttle(w.ErrorFrequency), tracer, w.ErrorLimit, w.MinFramesPerError, w.MaxFramesPerError))
+	for _, wk := range workload {
+
+		var g func(<-chan interface{}, *tracer.Tracer, int, int, int) generator
+
+		switch wk.EventType {
+		case Transaction:
+			g = transactions
+		case Error:
+			g = errors
+		}
+
+		if wk.Limit > 0 {
+			w.Add(g(throttle(wk.Frequency), t, wk.Limit, wk.MinStructs, wk.MaxStructs))
+		}
 	}
-	if w.TransactionLimit > 0 {
-		w.Add(transactions(throttle(w.TransactionFrequency), tracer, w.TransactionLimit, w.MinSpansPerTransaction, w.MaxSpansPerTransaction))
+	if runTimeout > 0 {
+		w.Add(timeout(runTimeout))
 	}
-	if w.RunTimeout > 0 {
-		w.Add(timeout(w.RunTimeout))
-	}
+	w.Add(handleSignals())
 
 	report := Report{Start: time.Now()}
 	err := w.Run()
 	report.Stop = time.Now()
-	tracer.FlushAll()
+	t.FlushAll()
 	report.End = time.Now()
-	report.Stats = tracer.Stats()
+	report.Stats = t.Stats()
 	return report, err
 }
 
@@ -162,7 +174,7 @@ func timeout(d time.Duration) generator {
 	}
 }
 
-func HandleSignals() generator {
+func handleSignals() generator {
 	return func(done <-chan struct{}) error {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt)
